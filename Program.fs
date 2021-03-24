@@ -28,9 +28,13 @@ type Producer(onNext: int64 -> RawEvent -> unit) =
 type InMemoryDbSim(?initial: int64) =
     member val Position = initial |> Option.defaultValue 0L with get, set
 
-    member this.UpdatePosition(p: int64) =
-        Logging.logInfo (nameof InMemoryDbSim) $"Updating position to {p}"
-        this.Position <- p
+    member val mutex = obj()
+
+    member this.UpdatePosition () =
+        lock this.mutex (fun _ ->
+            let newPosition = this.Position + 1L
+            Logging.logInfo (nameof InMemoryDbSim) $"Updating position to {newPosition}"
+            this.Position <- newPosition)
 
 module ErrorHandling =
     open Polly
@@ -58,7 +62,7 @@ module EventProcessor =
                     let! (message, (replyChan: AsyncReplyChannel<_ Async>)) = inbox.Receive()
 
                     try
-                        Logging.logInfo "Event Processor" $"Attempting to process {message}"
+                        Logging.logInfo "Event Processor" $"Attempting to process: {message}"
                         handleMessage f message |> ignore
                         Logging.logInfo "EventProcessor" "Event handled successfully"
 
@@ -68,19 +72,16 @@ module EventProcessor =
             })
 
 /// Defines functionality for:
-///  - Deserialize EventStore event
-///  - Queues from Event Store
+///  - Queues from Producer
 ///  - Updates event offset after each event is processed
 module StreamListener =
     type HandlerResult =
         | Processed
         | Skipped
 
-    let assertNext (db: InMemoryDbSim) p = (db.Position + 1L) = p
-
     let execute (eventProcessor: MailboxProcessor<_>) (positionDb: InMemoryDbSim) (position: int64) (event: Message) =
         // Check that the event position is next up otherwise skip it
-        if assertNext positionDb position
+        if positionDb.Position = position
         then
             // Send the event to the processor
             let result =
@@ -107,7 +108,7 @@ module StreamListener =
                     match ErrorHandling.policy.Execute(fun _ -> executor position event) with
                     | Processed ->
                         Logging.logInfo "Stream Listener" "Event Handled. Updating Consumer Position"
-                        positionDb.UpdatePosition(position)
+                        positionDb.UpdatePosition()
                     | Skipped ->
                         Logging.logInfo "Stream Listener" $"Event number {position} skipped. Consumer Position is Ahead"
 
@@ -134,6 +135,7 @@ let main _argv =
     // Note producer is ephermeral. They can die and come back and it won't break consumers
     let producer = Producer(onNext = producerOnEvent)
 
+    Logging.logBanner "Main" "Producing Events"
     // Seed 10 Events
     let i = [1..10] |> List.map (fun a -> producer.Produce('M'))
 
@@ -149,7 +151,7 @@ let main _argv =
 
     // Simulate a manual bump
     Logging.logBanner "Main" "Simulating manual offset bump!"
-    consumerOffset.UpdatePosition(13L)
+    consumerOffset.Position <- 13L
 
     System.Console.ReadLine() |> ignore
 
