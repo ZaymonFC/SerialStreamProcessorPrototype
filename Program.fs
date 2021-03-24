@@ -70,6 +70,9 @@ module StreamListener =
 
                     Logging.logInfo "Stream Listener" $"Received: {event}. Position: {position}"
 
+                    // We should check the offset in the DB here
+                    // - Ensure position = offset + 1.
+
                     // Process and block for completion
                     do!
                         eventProcessor.PostAndReply
