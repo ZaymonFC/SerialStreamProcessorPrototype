@@ -32,6 +32,17 @@ type InMemoryDbSim(?initial: int64) =
         Logging.logInfo (nameof InMemoryDbSim) $"Updating position to {p}"
         this.Position <- p
 
+module ErrorHandling =
+    open Polly
+    let logOnRetry (exn: System.Exception) (ts: System.TimeSpan) =
+        Logging.logError "Polly Handler" $"Error: {exn.Message}"
+        Logging.logInfo "Polly Handler" $"Retrying in {ts.TotalSeconds} seconds"
+
+    let policy =
+        Policy
+            .Handle<System.Exception>()
+            .WaitAndRetryForever((fun _ -> System.TimeSpan.FromSeconds(2.0)), onRetry=logOnRetry)
+
 module EventProcessor =
     // It should be noted that f is allowed to throw exceptions
     let handleMessage (f: MessageHandler) (m: Message) =
@@ -44,16 +55,16 @@ module EventProcessor =
         MailboxProcessor.Start (fun inbox ->
             async {
                 while true do
-                    let! (message, (replyChan: AsyncReplyChannel<unit Async>)) = inbox.Receive()
-                    // Define the root error boundary -- Polly Goes Here To Retry.
+                    let! (message, (replyChan: AsyncReplyChannel<_ Async>)) = inbox.Receive()
+
                     try
                         Logging.logInfo "Event Processor" $"Attempting to process {message}"
                         handleMessage f message |> ignore
                         Logging.logInfo "EventProcessor" "Event handled successfully"
-                        replyChan.Reply (async { return () })
-                    with | ex ->
-                        Logging.logError "Event Processor" $"{ex.Message}"
-                        Logging.logInfo "Event Processor" "Retrying Now"
+
+                        () |> Ok |> async.Return |> replyChan.Reply // ACK
+
+                    with | ex -> ex.Message |> Error |> async.Return |> replyChan.Reply // FAIL
             })
 
 /// Defines functionality for:
@@ -61,29 +72,47 @@ module EventProcessor =
 ///  - Queues from Event Store
 ///  - Updates event offset after each event is processed
 module StreamListener =
+    type HandlerResult =
+        | Processed
+        | Skipped
+
+    let assertNext (db: InMemoryDbSim) p = (db.Position + 1L) = p
+
+    let execute (eventProcessor: MailboxProcessor<_>) (positionDb: InMemoryDbSim) (position: int64) (event: Message) =
+        // Check that the event position is next up otherwise skip it
+        if assertNext positionDb position
+        then
+            // Send the event to the processor
+            let result =
+                eventProcessor.PostAndReply
+                     (fun (replyChan: AsyncReplyChannel<_ Async>) -> event, replyChan)
+                |> Async.RunSynchronously
+
+            match result with
+            | Ok () -> Processed
+            | Error ex -> failwith $"{ex}"
+
+        else Skipped
+
     let startListener (eventProcessor: MailboxProcessor<_>) (positionDb: InMemoryDbSim) =
         MailboxProcessor.Start (fun inbox ->
             async {
+                let executor = execute eventProcessor positionDb
+
                 while true do
                     // Get the event and position
                     let! event, position = inbox.Receive()
-
                     Logging.logInfo "Stream Listener" $"Received: {event}. Position: {position}"
 
-                    // We should check the offset in the DB here
-                    // - Ensure position = offset + 1.
-
-                    // Process and block for completion
-                    do!
-                        eventProcessor.PostAndReply
-                            (fun (replyChan: AsyncReplyChannel<unit Async>) -> event, replyChan)
-
-                    // Update Consumer Position()
-                    Logging.logInfo "Stream Listener" "Event Handled. Updating Consumer Position"
-                    positionDb.UpdatePosition(position)
+                    match ErrorHandling.policy.Execute(fun _ -> executor position event) with
+                    | Processed ->
+                        Logging.logInfo "Stream Listener" "Event Handled. Updating Consumer Position"
+                        positionDb.UpdatePosition(position)
+                    | Skipped ->
+                        Logging.logInfo "Stream Listener" $"Event number {position} skipped. Consumer Position is Ahead"
 
                     // Simulate a delay here to show that things can queue from the producer
-                    do! Async.Sleep(1000)
+                    do! Async.Sleep 100
             })
 
 let eventHandlerFunc m =
@@ -94,7 +123,7 @@ let eventHandlerFunc m =
 
 [<EntryPoint>]
 let main _argv =
-    let consumerOffset = InMemoryDbSim()
+    let consumerOffset = InMemoryDbSim(8L)
     let eventProcessor = EventProcessor.startProcessor eventHandlerFunc
     let streamListener = StreamListener.startListener eventProcessor consumerOffset
 
@@ -105,18 +134,23 @@ let main _argv =
     // Note producer is ephermeral. They can die and come back and it won't break consumers
     let producer = Producer(onNext = producerOnEvent)
 
-    producer.Produce('M')
-    producer.Produce('M')
-    producer.Produce('M')
-    producer.Produce('M')
+    // Seed 10 Events
+    let i = [1..10] |> List.map (fun a -> producer.Produce('M'))
+
+    // Produce an Erroneous Case
     producer.Produce('M')
     producer.Produce('E')
-    producer.Produce('T')
-    producer.Produce('M')
-    producer.Produce('M')
+
     producer.Produce('M')
     producer.Produce('M')
     producer.Produce('M')
 
+    System.Threading.Thread.Sleep(5000)
+
+    // Simulate a manual bump
+    Logging.logBanner "Main" "Simulating manual offset bump!"
+    consumerOffset.UpdatePosition(13L)
+
     System.Console.ReadLine() |> ignore
+
     0
