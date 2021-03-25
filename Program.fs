@@ -47,6 +47,9 @@ module ErrorHandling =
             .Handle<System.Exception>()
             .WaitAndRetryForever((fun _ -> System.TimeSpan.FromSeconds(2.0)), onRetry=logOnRetry)
 
+type EventProcessorReply = AsyncReplyChannel<Result<unit, string>>
+type EventProcessor = MailboxProcessor<Message * EventProcessorReply>
+
 module EventProcessor =
     // It should be noted that f is allowed to throw exceptions
     let handleMessage (f: MessageHandler) (m: Message) =
@@ -54,14 +57,18 @@ module EventProcessor =
         | Ok _ -> ()
         | Error e -> failwith $"{e}"
 
-    let processEvent (f: MessageHandler) message =
-        try
-            Logging.logInfo "Event Processor" $"Attempting to process: {message}"
-            handleMessage f message |> ignore
-            Logging.logInfo "EventProcessor" "Event handled successfully"
+    let startEventProcessor (f: MessageHandler) =
+        MailboxProcessor.Start (fun inbox -> async {
+            while true do
+                let! (message, (chan: AsyncReplyChannel<Result<_,_>>)) = inbox.Receive()
+                try
+                    Logging.logInfo "Event Processor" $"Attempting to process: {message}"
+                    handleMessage f message |> ignore
+                    Logging.logInfo "EventProcessor" "Event handled successfully"
 
-            () |> Ok // ACK
-        with | ex -> ex.Message |> Error // FAIL
+                    () |> Ok |> chan.Reply // ACK
+                with | ex -> ex.Message |> Error |> chan.Reply // FAIL
+        })
 
 /// Defines functionality for:
 ///  - Queues from Producer
@@ -71,12 +78,12 @@ module StreamListener =
         | Processed
         | Skipped
 
-    let executeWithFastForward (f: MessageHandler) (positionDb: InMemoryDbSim) (position: int64) (event: Message) =
+    let executeWithFastForward (eventProcessor: EventProcessor) (positionDb: InMemoryDbSim) (position: int64) (event: Message) =
         // Check that the event position is next up otherwise skip it
         if positionDb.Position = position
         then
             // Send the event to the processor
-            let result = EventProcessor.processEvent f event
+            let result = eventProcessor.PostAndReply (fun (chan: EventProcessorReply) -> event, chan)
 
             match result with
             | Ok () -> Processed
@@ -84,7 +91,7 @@ module StreamListener =
 
         else Skipped
 
-    let startListener (eventProcessor: _ -> Result<_,_>) (positionDb: InMemoryDbSim) =
+    let startListener (eventProcessor: EventProcessor) (positionDb: InMemoryDbSim) =
         MailboxProcessor.Start (fun inbox ->
             async {
                 let executor = executeWithFastForward eventProcessor positionDb
@@ -114,7 +121,8 @@ let eventHandlerFunc m =
 [<EntryPoint>]
 let main _argv =
     let consumerOffset = InMemoryDbSim(8L)
-    let streamListener = StreamListener.startListener eventHandlerFunc consumerOffset
+    let eventProcessor = EventProcessor.startEventProcessor eventHandlerFunc
+    let streamListener = StreamListener.startListener eventProcessor consumerOffset
 
     let producerOnEvent (position: int64) (rawEvent: RawEvent) =
         let message = Message.deserialize rawEvent
