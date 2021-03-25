@@ -48,7 +48,7 @@ module ErrorHandling =
             .WaitAndRetryForever((fun _ -> System.TimeSpan.FromSeconds(2.0)), onRetry=logOnRetry)
 
 type EventProcessorReply = AsyncReplyChannel<Result<unit, string>>
-type EventProcessor = MailboxProcessor<Message * EventProcessorReply>
+type EventProcessor<'a> = MailboxProcessor<'a * EventProcessorReply>
 
 module EventProcessor =
     // It should be noted that f is allowed to throw exceptions
@@ -57,7 +57,7 @@ module EventProcessor =
         | Ok _ -> ()
         | Error e -> failwith $"{e}"
 
-    let startEventProcessor (f: MessageHandler) =
+    let startEventProcessor (f: MessageHandler) : EventProcessor<_> =
         MailboxProcessor.Start (fun inbox -> async {
             while true do
                 let! (message, (chan: AsyncReplyChannel<Result<_,_>>)) = inbox.Receive()
@@ -70,15 +70,15 @@ module EventProcessor =
                 with | ex -> ex.Message |> Error |> chan.Reply // FAIL
         })
 
-/// Defines functionality for:
-///  - Queues from Producer
-///  - Updates event offset after each event is processed
+type ConsumerOffset = int64
+
+type StreamListener<'a> = MailboxProcessor<'a * ConsumerOffset>
 module StreamListener =
     type HandlerResult =
         | Processed
         | Skipped
 
-    let executeWithFastForward (eventProcessor: EventProcessor) (positionDb: InMemoryDbSim) (position: int64) (event: Message) =
+    let executeWithFastForward (eventProcessor: EventProcessor<_>) (positionDb: InMemoryDbSim) (position: int64) (event: Message) =
         // Check that the event position is next up otherwise skip it
         if positionDb.Position = position
         then
@@ -91,7 +91,7 @@ module StreamListener =
 
         else Skipped
 
-    let startListener (eventProcessor: EventProcessor) (positionDb: InMemoryDbSim) =
+    let startListener (eventProcessor: EventProcessor<_>) (positionDb: InMemoryDbSim) : StreamListener<_> =
         MailboxProcessor.Start (fun inbox ->
             async {
                 let executor = executeWithFastForward eventProcessor positionDb
